@@ -1,8 +1,19 @@
-### IntelliJ IDEA ###
+# Playtech submission: source code only (no jars, no compiler output in repo)
+*.class
+*.jar
+*.war
+*.nar
+
+# IDE / build output
 out/
-!**/src/main/**/out/
-!**/src/test/**/out/
+build/
+target/
+bin/
+
+### IntelliJ IDEA ###
 .kotlin
+*.iml
+.idea/
 
 ### Eclipse ###
 .apt_generated
@@ -12,9 +23,6 @@ out/
 .settings
 .springBeans
 .sts4-cache
-bin/
-!**/src/main/**/bin/
-!**/src/test/**/bin/
 
 ### NetBeans ###
 /nbproject/private/
@@ -26,10 +34,6 @@ bin/
 ### VS Code ###
 .vscode/
 
-### Mac OS ###
+### OS ###
 .DS_Store
-
-*.class
-*.jar
-*.iml
-.idea/
+Thumbs.db
