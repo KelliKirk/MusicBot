@@ -1,35 +1,44 @@
 import java.io.BufferedReader;
 import java.io.InputStreamReader;
 import java.io.PrintStream;
+import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
+import java.util.Locale;
 
 public class MusicBot {
 
     static final String CATEGORY = "Music";
 
-    // Budget management
     static long initialBudget;
     static long remaining;
 
-    // Round tracking
-    static int  roundNumber      = 0;
-    static long totalPointsWon   = 0;
-    static long totalEbucksSpent = 0;
+    static int roundNumber = 0;
 
-    // Adaptive state (updated every 100 rounds via summary)
-    // Tracks efficiency: points per ebuck. Used to adjust aggression.
-    static double currentEfficiency     = 0.0;
-    static double targetEfficiencyFloor = 0.3;
+    static double currentEfficiency = 0.35;
+    static final double EFF_SMOOTH = 0.3;
+    static final double targetEfficiencyFloor = 0.26;
 
-    // Bid sizing constants
-    static final int    FLAT_LOW_BID    = 1;   // minimum bid for low-value rounds
-    static final double HIGH_VALUE_FRAC = 0.002; // 0.2% of remaining per high-value round
+    /** Tiny liquidity only — large reserves violate the “30% implicit spend” incentive. */
+    static final double RESERVE_FRAC = 0.0008;
+    static final int DEBUG_ROUNDS = 0;
 
     public static void main(String[] args) {
-        initialBudget = (args.length > 0) ? Long.parseLong(args[0]) : 10_000_000L;
-        remaining     = initialBudget;
+        if (args.length < 1) {
+            System.err.println("Usage: java MusicBot <total_ebucks>");
+            System.exit(1);
+            return;
+        }
+        initialBudget = Long.parseLong(args[0]);
+        if (initialBudget <= 0L) {
+            System.err.println("Budget must be positive.");
+            System.exit(1);
+            return;
+        }
+        remaining = initialBudget;
 
-        BufferedReader in  = new BufferedReader(new InputStreamReader(System.in));
-        PrintStream    out = System.out;
+        BufferedReader in = new BufferedReader(
+                new InputStreamReader(System.in, StandardCharsets.UTF_8));
+        PrintStream out = new PrintStream(System.out, true, StandardCharsets.UTF_8);
 
         out.println(CATEGORY);
         out.flush();
@@ -37,25 +46,33 @@ public class MusicBot {
         try {
             String line;
             while ((line = in.readLine()) != null) {
-                line = line.trim();
-                if (line.isEmpty()) continue;
+                line = stripBom(line.trim());
+                if (line.isEmpty()) {
+                    continue;
+                }
 
-                if (line.startsWith("S ")) {
-                    // Summary every 100 rounds and update adaptive state
+                if (line.startsWith("S ") || line.startsWith("S\t")) {
                     handleSummary(line);
-
-                } else if (line.startsWith("W ") || line.equals("L")) {
-                    // Win/Loss result for the last round
+                } else if (line.startsWith("W") || line.equals("L") || line.startsWith("L ")) {
                     handleResult(line);
-
-                } else if (line.contains("video.") || line.contains("viewer.")) {
-                    // New auction round
+                } else if (looksLikeAuctionPayload(line)) {
                     roundNumber++;
                     AuctionInfo auction = AuctionInfo.parse(line);
-
-                    int[] bid = decideBid(auction);
+                    int[] bid = decideBid(auction, line);
                     out.println(bid[0] + " " + bid[1]);
                     out.flush();
+                    if (roundNumber <= DEBUG_ROUNDS) {
+                        System.err.println("[DBG] r=" + roundNumber
+                                + " cat='" + auction.category + "'"
+                                + " q=" + ValueEstimator.score(auction, CATEGORY)
+                                + " bid=" + bid[0]
+                                + " rem=" + remaining);
+                    }
+                } else {
+                    // Ignore non-auction, non-result lines to avoid protocol desync.
+                    if (roundNumber < DEBUG_ROUNDS) {
+                        System.err.println("[DBG] ignored: " + line);
+                    }
                 }
             }
         } catch (Exception e) {
@@ -63,78 +80,162 @@ public class MusicBot {
         }
     }
 
-    static int[] decideBid(AuctionInfo a) {
-        double score = ValueEstimator.score(a, CATEGORY);
-
-        // Dynamic threshold: starts at 0.55, adjusts based on performance
-        double threshold = computeThreshold();
-
-        if (score >= threshold) {
-            // HIGH VALUE auction - bid meaningfully
-            long maxBidLong = (long)(remaining * HIGH_VALUE_FRAC);
-            int  maxBid     = (int) Math.max(2, Math.min(maxBidLong, remaining));
-
-            // Safety: never drop below 2% of initial budget (elimination threshold)
-            long safeFloor = (long)(initialBudget * 0.025);
-            if (remaining - maxBid < safeFloor) {
-                maxBid = (int) Math.max(1, remaining - safeFloor);
-            }
-
-            return new int[]{maxBid, maxBid};
-
-        } else {
-            // LOW VALUE auction - participate minimally
-            return new int[]{FLAT_LOW_BID, FLAT_LOW_BID};
+    static String stripBom(String line) {
+        if (!line.isEmpty() && line.charAt(0) == '\uFEFF') {
+            return line.substring(1);
         }
+        return line;
     }
 
-    static double computeThreshold() {
-        // Base threshold - only bid on clearly above-average auctions
-        double base = 0.55;
-
-        if (roundNumber < 100) return base;
-
-        if (currentEfficiency > targetEfficiencyFloor * 2) {
-            return base + 0.10; // doing very well - be more selective
-        } else if (currentEfficiency < targetEfficiencyFloor) {
-            return base - 0.10; // underperforming - open up more
+    static boolean looksLikeAuctionPayload(String line) {
+        if (line.indexOf('=') >= 0) {
+            return true;
         }
-        return base;
+        String lc = line.toLowerCase(Locale.ROOT);
+        return lc.contains("video") || lc.contains("viewer");
+    }
+
+    static long reserveAmount() {
+        long r = (long) (initialBudget * RESERVE_FRAC);
+        return Math.max(1L, Math.min(r, remaining));
+    }
+
+    static int[] decideBid(AuctionInfo a, String rawLine) {
+        long reserve = reserveAmount();
+        if (remaining <= reserve + 1L) {
+            return new int[]{1, 1};
+        }
+        long usable = remaining - reserve;
+
+        int tier = ValueEstimator.categoryTier(a, CATEGORY);
+        if (tier != 2) {
+            return new int[]{1, 1};
+        }
+
+        double q = ValueEstimator.score(a, CATEGORY);
+        if (!looksLikeAuctionPayload(rawLine)) {
+            q *= 0.25;
+        }
+        q = Math.min(1.0, Math.max(0.0, q));
+        if (a.interests.length > 0 && CATEGORY.equalsIgnoreCase(a.interests[0].trim())) {
+            q = Math.min(1.0, q + 0.07);
+        }
+
+        double q2 = q * q;
+        double q3 = q2 * q;
+        double frac = 0.000055 + 0.00035 * q2 + 0.00105 * q3;
+        long maxBid = (long) (usable * frac);
+
+        maxBid = (long) (maxBid * spendPressureMusic() * efficiencyTieBreak());
+
+        long perRoundCap = Math.min(usable / 14, initialBudget / 26);
+        maxBid = Math.min(maxBid, perRoundCap);
+
+        maxBid = Math.max(1L, Math.min(maxBid, usable));
+
+        if (maxBid > Integer.MAX_VALUE) {
+            maxBid = Integer.MAX_VALUE;
+        }
+        int b = (int) maxBid;
+        return new int[]{b, b};
+    }
+
+    static double spendPressureMusic() {
+        long spent = initialBudget - remaining;
+        double targetFrac = 1.0 - Math.exp(-roundNumber / 4200.0);
+        targetFrac = Math.min(0.9, Math.max(0.1, targetFrac));
+        long targetSpend = (long) (initialBudget * targetFrac * 0.82);
+        if (spent + initialBudget / 250L < targetSpend) {
+            return 1.08;
+        }
+        if (spent + initialBudget / 120L < targetSpend) {
+            return 1.04;
+        }
+        return 1.0;
+    }
+
+    static double efficiencyTieBreak() {
+        if (currentEfficiency < 0.04) {
+            return 0.82;
+        }
+        if (currentEfficiency < 0.12) {
+            return 0.92;
+        }
+        if (currentEfficiency < targetEfficiencyFloor) {
+            return 0.98;
+        }
+        return 1.0;
     }
 
     static void handleResult(String line) {
-        if (line.startsWith("W ")) {
-            int cost = Integer.parseInt(line.substring(2).trim());
-            remaining        -= cost;
-            totalEbucksSpent += cost;
-            log("Round " + roundNumber + " WON cost=" + cost
-                    + " remaining=" + remaining);
-        } else {
-            log("Round " + roundNumber + " LOST");
+        if (line.startsWith("W")) {
+            long cost = firstNumberAfterPrefix(line, 'W');
+            if (cost > 0L) {
+                remaining -= cost;
+                if (remaining < 0L) {
+                    remaining = 0L;
+                }
+            }
         }
+    }
+
+    static long firstNumberAfterPrefix(String s, char prefix) {
+        int i = 0;
+        while (i < s.length() && s.charAt(i) != prefix) {
+            i++;
+        }
+        if (i >= s.length()) {
+            return 0L;
+        }
+        // Move past prefix char
+        i++;
+        // Scan to first digit
+        while (i < s.length()) {
+            char c = s.charAt(i);
+            if (c >= '0' && c <= '9') {
+                break;
+            }
+            i++;
+        }
+        long v = 0L;
+        boolean saw = false;
+        while (i < s.length()) {
+            char c = s.charAt(i);
+            if (c < '0' || c > '9') {
+                break;
+            }
+            v = v * 10L + (c - '0');
+            saw = true;
+            i++;
+        }
+        return saw ? v : 0L;
     }
 
     static void handleSummary(String line) {
-        // Format: S {points} {ebucks}
-        String[] p = line.split("\\s+");
-        if (p.length >= 3) {
-            totalPointsWon   = Long.parseLong(p[1]);
-            totalEbucksSpent = Long.parseLong(p[2]);
-
-            // Recalculate efficiency
-            if (totalEbucksSpent > 0) {
-                currentEfficiency = (double) totalPointsWon / totalEbucksSpent;
+        ArrayList<Long> nums = new ArrayList<>();
+        for (String t : line.split("\\s+")) {
+            if (t.isEmpty() || t.equals("S")) {
+                continue;
             }
-
-            log("=== SUMMARY round=" + roundNumber
-                    + " points=" + totalPointsWon
-                    + " spent=" + totalEbucksSpent
-                    + " efficiency=" + String.format("%.4f", currentEfficiency)
-                    + " remaining=" + remaining + " ===");
+            try {
+                nums.add(Long.parseLong(t));
+            } catch (NumberFormatException ignored) {
+            }
         }
-    }
-
-    static void log(String msg) {
-        System.err.println("[MusicBot] " + msg);
+        if (nums.size() < 2) {
+            return;
+        }
+        long windowPoints = nums.get(nums.size() - 2);
+        long windowSpent = nums.get(nums.size() - 1);
+        if (windowSpent <= 0L) {
+            currentEfficiency = 0.65 * currentEfficiency + 0.35 * 0.12;
+            currentEfficiency = Math.max(0.0, Math.min(50.0, currentEfficiency));
+            return;
+        }
+        double instant = (double) windowPoints / (double) windowSpent;
+        if (Double.isFinite(instant) && instant >= 0.0) {
+            currentEfficiency = EFF_SMOOTH * instant + (1.0 - EFF_SMOOTH) * currentEfficiency;
+            currentEfficiency = Math.max(0.0, Math.min(50.0, currentEfficiency));
+        }
     }
 }
