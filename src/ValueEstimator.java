@@ -2,7 +2,7 @@ public final class ValueEstimator {
 
     private ValueEstimator() {
     }
-    
+
     public static int categoryTier(AuctionInfo a, String ourCategory) {
         if (a.category == null || a.category.isEmpty()) {
             return 0;
